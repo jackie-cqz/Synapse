@@ -344,3 +344,30 @@ function readArgvLog(argvLog: string): string[] {
     .map((line) => line.trim())
     .filter(Boolean)
 }
+
+test("clean exit-0 turn emits NO error event (spurious-error regression)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-cleanexit-"))
+  const fakeBinary = writeFakeOpencode(dir, "fake-opencode-clean")
+  const driver = new OpencodeDriver()
+  const session = await driver.createSession({
+    remoteAgentId: "agent-1",
+    conversationId: "conv-8",
+    workingDirectory: dir,
+    initialPrompt: "hi",
+    runtimePath: fakeBinary,
+  })
+  try {
+    const events = await collectSessionEvents(session)
+    const kinds = events.map((event) => event.kind)
+    // The fake exits 0 after a full NDJSON turn: that is a SUCCESS. The old
+    // finalizeTurn pushed "exited with code 0" as an error on every clean
+    // turn — poison for last_error bookkeeping. Only the terminal is allowed.
+    assert.ok(
+      !kinds.includes("error"),
+      `clean exit must not emit error, saw ${kinds.join(",")}`
+    )
+    assert.equal(kinds[kinds.length - 1], "turn_completed")
+  } finally {
+    await session.close("test done")
+  }
+})

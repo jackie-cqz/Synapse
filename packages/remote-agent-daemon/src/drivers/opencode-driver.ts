@@ -100,7 +100,7 @@ class OpencodeAgentSession implements AgentSession {
     readonly conversationId: string,
     private readonly runtimePath: string,
     private readonly workingDirectory: string,
-    private readonly initialPrompt: string,
+    bootstrapPrompt: string,
     initialSessionId: string | undefined,
     mcpServers: Record<string, McpServerConfig> | undefined,
     childEnvOverlay: Record<string, string | undefined> | undefined
@@ -110,7 +110,7 @@ class OpencodeAgentSession implements AgentSession {
     this.childEnvOverlay = childEnvOverlay ?? {}
     // Bootstrap turn: the runtime armed a gate for the seeded epoch before
     // createSession resolved, so its terminal must come from this first run.
-    this.sendChain = this.sendChain.then(() => this.runTurn(initialPrompt))
+    this.sendChain = this.sendChain.then(() => this.runTurn(bootstrapPrompt))
   }
 
   get sessionId() {
@@ -175,12 +175,18 @@ class OpencodeAgentSession implements AgentSession {
   }
 
   private finalizeTurn(outcome: TurnOutcome, code: number | null, signal: string | null) {
-    const detail =
-      signal && code === null
-        ? `opencode run terminated by ${signal}`
-        : `opencode run exited with code ${code ?? "?"}`
     const stderr = this.stderrTail.join("").trim()
-    if (!outcome.sawErrorEvent) {
+    const cleanExit = code === 0
+    if (!cleanExit && !outcome.sawErrorEvent) {
+      // Non-zero exit with no JSON error line: surface the exit status (plus a
+      // bounded stderr tail — e.g. "Session not found" on a stale -s id
+      // arrives ONLY on stderr, exit 1). A clean exit-0 turn emits no error —
+      // spurious errors on every successful turn would poison the
+      // conversation's last_error bookkeeping.
+      const detail =
+        signal && code === null
+          ? `opencode run terminated by ${signal}`
+          : `opencode run exited with code ${code ?? "?"}`
       const message = stderr ? `${detail}: ${stderr.slice(-500)}` : detail
       this.eventQueue.push({ kind: "error", message })
     }
