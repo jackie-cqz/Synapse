@@ -133,6 +133,18 @@ export class PiAgentSession implements AgentSession {
    * delivered on its own) must not fabricate terminals (§5d).
    */
   private dispatchedTurns = 0
+  /**
+   * Auto-compaction continuation window. When the SDK's post-run hook
+   * compacts and calls agent.continue(), a single dispatched turn spans
+   * MULTIPLE low-level runs, each ending with its own agent_end
+   * (agent-loop emits one per runLoop). The intermediate agent_end must not
+   * count as the turn terminal — the SDK is still working. compaction_end
+   * (fired by _runAutoCompaction) brackets the window: an agent_end arriving
+   * after a compaction_end within a dispatched turn is treated as an
+   * intermediate boundary, and the terminal is the LAST agent_end (the one
+   * with no compaction_end behind it since the previous agent_end).
+   */
+  private compactionContinuationPending = false
 
   constructor(
     readonly remoteAgentId: string,
@@ -144,6 +156,11 @@ export class PiAgentSession implements AgentSession {
 
   get sessionId() {
     return this.piSessionId
+  }
+
+  /** Non-fatal driver-level notice (e.g. resume degraded to a fresh session). */
+  emitError(message: string) {
+    this.eventQueue.push({ kind: "error", message })
   }
 
   attach(sdk: PiSdkAgentSession) {
@@ -183,6 +200,17 @@ export class PiAgentSession implements AgentSession {
         // A retry continuation keeps the turn alive — its terminal is the
         // FINAL attempt's agent_end (willRetry=false).
         if (event.willRetry) return
+        if (
+          this.dispatchedTurns > 0 &&
+          this.compactionContinuationPending
+        ) {
+          // Intermediate agent_end of a compaction continuation: the SDK's
+          // post-run hook compacted and called agent.continue(), so another
+          // run (and its agent_end) is still coming. Consuming the terminal
+          // here would mark the turn complete while the SDK is still working.
+          this.compactionContinuationPending = false
+          return
+        }
         if (this.dispatchedTurns > 0) {
           this.dispatchedTurns -= 1
           this.eventQueue.push({ kind: "turn_completed" })
@@ -190,6 +218,14 @@ export class PiAgentSession implements AgentSession {
         // A stray run with no dispatched turn is ignored — the runtime's
         // terminal guard tolerates nothing here, and fabricating a terminal
         // would advance the gate past a live turn.
+        return
+      }
+      case "compaction_end": {
+        // Auto-compaction completed. If the SDK decides to continue the turn
+        // (queued messages / overflow recovery), the NEXT agent_end belongs
+        // to the same dispatched turn — flag it so the handler above defers
+        // the terminal to the eventual final run.
+        this.compactionContinuationPending = true
         return
       }
       case "auto_retry_end": {
@@ -366,6 +402,10 @@ export class PiDriver implements AgentDriver {
     )
 
     const sessionManager = this.resolveSessionManager(spec)
+    if (this.lastResumeFallbackReason) {
+      session.emitError(this.lastResumeFallbackReason)
+      this.lastResumeFallbackReason = undefined
+    }
 
     // Reverse-MCP (and any other injected servers) ride an inline extension:
     // pi.registerMcpServer with exposure "direct" declares the tools to the
@@ -413,9 +453,20 @@ export class PiDriver implements AgentDriver {
         spec.resumeSessionId
       )
       if (path) {
-        // cwdOverride keeps the session bound to the (per-conversation)
-        // working directory even if the file's header carries an older cwd.
-        return SessionManager.open(path, undefined, spec.workingDirectory)
+        try {
+          // cwdOverride keeps the session bound to the (per-conversation)
+          // working directory even if the file's header carries an older cwd.
+          return SessionManager.open(path, undefined, spec.workingDirectory)
+        } catch (error) {
+          // Corrupt/unreadable session file. Without this fallback every
+          // wake re-throws on the SAME file and the conversation wedges
+          // permanently (the api keeps resending the same resumeSessionId).
+          // Degrade to a fresh session instead — context is lost, the
+          // conversation lives. The new session id is published back to the
+          // api via session_started, so the stale id self-corrects.
+          const message = error instanceof Error ? error.message : String(error)
+          this.lastResumeFallbackReason = `pi session ${spec.resumeSessionId} failed to load (${message}); starting a fresh session`
+        }
       }
       // Session file gone (cleaned up / different machine): fall through to a
       // fresh session rather than failing the wake — the new session id is
@@ -423,6 +474,7 @@ export class PiDriver implements AgentDriver {
     }
     return SessionManager.create(spec.workingDirectory)
   }
+  private lastResumeFallbackReason: string | undefined
 }
 
 function applyEnvOverlay(

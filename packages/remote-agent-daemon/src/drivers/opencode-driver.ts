@@ -190,6 +190,18 @@ class OpencodeAgentSession implements AgentSession {
       const message = stderr ? `${detail}: ${stderr.slice(-500)}` : detail
       this.eventQueue.push({ kind: "error", message })
     }
+    // Self-heal a stale resume id: opencode reports "Session not found" ONLY
+    // on stderr with exit 1 (verified on 1.18.33). Without this, every later
+    // turn re-sends the same dead --session id and the conversation wedges
+    // permanently — the next turn starts a FRESH session instead (context is
+    // lost, but the conversation lives).
+    if (
+      !cleanExit &&
+      this.cachedSessionId &&
+      /session\s+not\s+found/i.test(stderr)
+    ) {
+      this.cachedSessionId = undefined
+    }
     this.eventQueue.push({ kind: "turn_completed" })
   }
 

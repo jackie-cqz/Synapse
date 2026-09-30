@@ -242,6 +242,42 @@ test("stray agent_end with no dispatched turn is suppressed", async () => {
   )
 })
 
+test("compaction continuation defers the terminal to the LAST agent_end", async () => {
+  const { session, sdk, collector } = attachSession()
+  await session.send("long turn")
+  sdk.emit({ type: "agent_start" })
+  // First low-level run ends, then the SDK's post-run hook compacts and
+  // calls agent.continue() — a second run follows within the SAME turn.
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  // No compaction_end yet: this is a plain terminal.
+  let events = await collector.snapshot()
+  assert.equal(
+    events.filter((event) => event.kind === "turn_completed").length,
+    1
+  )
+
+  // Now the compaction path: run 1 ends after a compaction_end (the SDK
+  // compacted mid-run and continued) — that intermediate agent_end must NOT
+  // terminal the turn while run 2 is still going.
+  await session.send("another turn")
+  sdk.emit({ type: "compaction_end", reason: "threshold", result: undefined, aborted: false, willRetry: false })
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  events = await collector.snapshot()
+  assert.equal(
+    events.filter((event) => event.kind === "turn_completed").length,
+    1,
+    "intermediate agent_end after compaction must not terminal the turn"
+  )
+  // The continuation run finishes — only now is the second terminal allowed.
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  await session.close("done")
+  events = await collector.end()
+  assert.equal(
+    events.filter((event) => event.kind === "turn_completed").length,
+    2
+  )
+})
+
 test("send while streaming routes through followUp", async () => {
   const { session, sdk, collector } = attachSession()
   sdk.isStreaming = true
