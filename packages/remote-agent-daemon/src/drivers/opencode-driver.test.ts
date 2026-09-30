@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { OpencodeDriver } from "./opencode-driver.js"
@@ -11,6 +11,25 @@ const FAKE_SESSION_ID = "ses_fake_1234"
 function writeFakeOpencode(dir: string, name: string): string {
   const script = `#!/bin/sh
 # Fake opencode for driver tests. Emits a canned --format json turn.
+echo '{"type":"step_start","timestamp":1,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"step-start"}}'
+echo '{"type":"text","timestamp":2,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"text","text":"fake reply","time":{"start":1,"end":2}}}'
+echo '{"type":"step_finish","timestamp":3,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"step-finish","reason":"stop"}}'
+exit 0
+`
+  const filePath = path.join(dir, name)
+  writeFileSync(filePath, script, { mode: 0o755 })
+  return filePath
+}
+
+/**
+ * Fake opencode that records the argv it was invoked with (one arg per line)
+ * before emitting the canned NDJSON turn. Used to pin the resume contract:
+ * the first run must NOT pass --session; after the session id is captured,
+ * every later send must pass --session <id>.
+ */
+function writeArgRecordingOpencode(dir: string, name: string, argvLog: string): string {
+  const script = `#!/bin/sh
+printf '%s\n' "$@" > "${argvLog}"
 echo '{"type":"step_start","timestamp":1,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"step-start"}}'
 echo '{"type":"text","timestamp":2,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"text","text":"fake reply","time":{"start":1,"end":2}}}'
 echo '{"type":"step_finish","timestamp":3,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"step-finish","reason":"stop"}}'
@@ -271,3 +290,57 @@ test("missing binary surfaces as a spawn error terminal, not a wedge", async () 
     await session.close("test done")
   }
 })
+
+test("resume contract: first run has no --session, follow-up sends pass --session <captured id>", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-argv-"))
+  const argvLog = path.join(dir, "argv.log")
+  const fakeBinary = writeArgRecordingOpencode(dir, "fake-opencode-argv", argvLog)
+  const driver = new OpencodeDriver()
+
+  const session = await driver.createSession({
+    remoteAgentId: "agent-1",
+    conversationId: "conv-7",
+    workingDirectory: dir,
+    initialPrompt: "first turn",
+    runtimePath: fakeBinary,
+  })
+
+  try {
+    // Bootstrap turn: session id is unknown, so --session must NOT be passed.
+    await collectSessionEvents(session)
+    const firstArgv = readArgvLog(argvLog)
+    assert.ok(
+      !firstArgv.includes("--session"),
+      `first run must not pass --session, saw ${firstArgv.join(" ")}`
+    )
+    // Sanity: the run subcommand and json format are always present.
+    assert.ok(firstArgv.includes("run"))
+    assert.ok(firstArgv.includes("json"))
+    assert.equal(session.sessionId, FAKE_SESSION_ID)
+
+    // Follow-up send: the captured session id must ride along as --session <id>.
+    const sendPromise = session.send("second turn")
+    await collectSessionEvents(session)
+    await sendPromise
+    const secondArgv = readArgvLog(argvLog)
+    const sessionFlagIndex = secondArgv.indexOf("--session")
+    assert.ok(
+      sessionFlagIndex !== -1,
+      `follow-up run must pass --session, saw ${secondArgv.join(" ")}`
+    )
+    assert.equal(
+      secondArgv[sessionFlagIndex + 1],
+      FAKE_SESSION_ID,
+      `--session must carry the captured id, saw ${secondArgv.join(" ")}`
+    )
+  } finally {
+    await session.close("test done")
+  }
+})
+
+function readArgvLog(argvLog: string): string[] {
+  return readFileSync(argvLog, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
