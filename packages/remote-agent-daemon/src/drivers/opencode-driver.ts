@@ -132,8 +132,14 @@ class OpencodeAgentSession implements AgentSession {
       if (mapped) servers[name] = mapped
     }
     if (Object.keys(servers).length > 0) {
-      env.OPENCODE_CONFIG = mergeOpencodeConfigEnv(
-        env.OPENCODE_CONFIG,
+      // opencode 1.18.x config channels (verified against the binary's config
+      // loader): OPENCODE_CONFIG is a PATH to a config file, while
+      // OPENCODE_CONFIG_CONTENT carries inline JSON merged as a "local" config
+      // layer. Passing JSON content via OPENCODE_CONFIG silently no-ops (the
+      // path never exists) and the reverse-MCP tools never reach the model —
+      // the live smoke run caught exactly that.
+      env.OPENCODE_CONFIG_CONTENT = mergeOpencodeConfigEnv(
+        env.OPENCODE_CONFIG_CONTENT,
         servers
       )
     }

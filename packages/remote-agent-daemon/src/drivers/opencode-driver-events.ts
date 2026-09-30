@@ -124,10 +124,14 @@ export function toOpencodeMcpServer(
 }
 
 /**
- * Merge our `mcp` servers into the OPENCODE_CONFIG env value the child will
- * read. opencode has no per-run MCP flag on `run` (`-c` is `--continue`), so
- * config injection rides through the env (verified live: env config loads).
- * Our servers win over same-named entries in a pre-existing config; an
+ * Merge our `mcp` servers into the OPENCODE_CONFIG_CONTENT env value the
+ * child will read. opencode has no per-run MCP flag on `run` (`-c` is
+ * `--continue`), so config injection rides through the env.
+ *
+ * Channel note (verified against opencode 1.18.33's binary): OPENCODE_CONFIG
+ * takes a PATH to a config file; OPENCODE_CONFIG_CONTENT takes inline JSON.
+ * Inline content is the right channel here — no temp-file lifecycle to own.
+ * Our servers win over same-named entries in a pre-existing value; an
  * unparseable existing value is replaced, not crashed on.
  */
 export function mergeOpencodeConfigEnv(
