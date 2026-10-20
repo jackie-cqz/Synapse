@@ -48,6 +48,7 @@ import {
 import { ConversationTurns } from "./conversation-turns.js"
 import type {
   AgentSessionEvent,
+  DaemonRuntimeCapabilities,
   PermissionDecision,
   RuntimeCatalogEntry,
   RuntimeKind,
@@ -91,14 +92,6 @@ type DaemonConfig = {
 }
 
 type LogLevel = "error" | "warn" | "info" | "debug"
-
-type DaemonRuntimeCapabilities = {
-  supportsRequestUserInput?: boolean
-  supportsPlanMode?: boolean
-  supportsPersistentSession?: boolean
-  supportsCodexAppServer?: boolean
-  supportsStructuredIo?: boolean
-}
 
 const DEFAULT_HEARTBEAT_MS = 30_000
 const DEFAULT_RECONNECT_MS = 3_000
