@@ -15,13 +15,26 @@ import { PiDriver } from "./pi-driver.js"
  * followUp/isStreaming/abort/dispose/sessionId) onto AgentSessionEvents. The
  * tests drive the captured subscribe listener by hand — no real pi runtime
  * (auth/models under ~/.pi/agent) is touched.
+ *
+ * Turn-terminal semantics (review #11): the terminal is the SDK's
+ * `agent_settled` event — the real SDK emits it exactly once per dispatched
+ * run, AFTER retry continuations and auto-compaction continuations, right
+ * before session.prompt() resolves. The fake mirrors that ordering by
+ * default (promptImpl emits agent_settled, then resolves); event-order tests
+ * override promptImpl with a never-settling gate and emit the SDK's REAL
+ * event order by hand (agent_end BEFORE compaction_end; threshold compaction
+ * has no second agent_end).
  */
 type SdkEvent = Record<string, unknown> & { type: string }
 
 class FakeSdkSession {
   sessionId = `sess-${randomUUID().slice(0, 8)}`
   isStreaming = false
-  promptImpl: (text: string) => Promise<void> = async () => {}
+  promptImpl: (text: string) => Promise<void> = async () => {
+    // Real ordering: agent_settled (the terminal) fires just before the
+    // prompt() promise resolves.
+    this.emit({ type: "agent_settled" })
+  }
   followUps: string[] = []
   prompts: string[] = []
   aborted = 0
@@ -37,6 +50,11 @@ class FakeSdkSession {
 
   emit(event: SdkEvent) {
     this.listener?.(event)
+  }
+
+  /** Override promptImpl so the run never settles on its own. */
+  holdRuns() {
+    this.promptImpl = () => new Promise<void>(() => {})
   }
 
   async prompt(text: string) {
@@ -106,6 +124,9 @@ function attachSession(initialSessionId?: string) {
   return { session, sdk, collector: new EventCollector(session) }
 }
 
+const countTerminals = (events: AgentSessionEvent[]) =>
+  events.filter((event) => event.kind === "turn_completed").length
+
 test("PiDriver metadata: kind, label, capabilities", () => {
   const driver = new PiDriver()
   assert.equal(driver.runtimeKind, "pi")
@@ -126,7 +147,6 @@ test("PiDriver.detect prefers SYNAPSE_PI_PATH and probes --version", () => {
   try {
     const entry = new PiDriver().detect()
     assert.equal(entry.runtimeKind, "pi")
-    // In-process SDK: always available, binary is metadata only.
     assert.equal(entry.status, "available")
     assert.equal(entry.executablePath, script)
     assert.equal(entry.version, "pi 0.99.1-test")
@@ -136,16 +156,21 @@ test("PiDriver.detect prefers SYNAPSE_PI_PATH and probes --version", () => {
   }
 })
 
-test("PiDriver.detect stays available without any pi binary", () => {
+test("PiDriver.detect reports missing_binary without a pi CLI (review #11 item 4)", () => {
   const originalPath = process.env.PATH
   const originalSynapse = process.env.SYNAPSE_PI_PATH
   process.env.PATH = "/tmp/__nonexistent_path_segment_for_test"
   delete process.env.SYNAPSE_PI_PATH
   try {
     const entry = new PiDriver().detect()
-    assert.equal(entry.status, "available")
+    assert.equal(entry.runtimeKind, "pi")
+    // The supervisor gates starts on status available + executablePath, so
+    // available-without-path would arm turns that fail at wake. Honest
+    // signal: missing_binary with actionable guidance.
+    assert.equal(entry.status, "missing_binary")
     assert.equal(entry.executablePath, undefined)
-    assert.equal(entry.metadata?.note, "in-process SDK; pi binary not on PATH")
+    assert.match(entry.lastError ?? "", /pi CLI not found/)
+    assert.match(entry.lastError ?? "", /SYNAPSE_PI_PATH/)
   } finally {
     if (originalPath !== undefined) process.env.PATH = originalPath
     if (originalSynapse !== undefined)
@@ -209,88 +234,159 @@ test("message_end maps assistant text, ignores thinking/user/tool messages", asy
   ])
 })
 
-test("agent_end emits exactly one turn_completed per dispatched turn", async () => {
+test("agent_settled is the single terminal per dispatched turn; retry agent_ends are not terminals", async () => {
   const { session, sdk, collector } = attachSession()
+  sdk.holdRuns()
   await session.send("do something")
   sdk.emit({ type: "agent_start" })
-  // A retry continuation must NOT terminal the turn — check mid-sequence so
-  // an early terminal (the willRetry guard removed) cannot hide behind the
-  // final agent_end's suppression.
+  // Retry continuation and stray run events must NOT terminal the turn.
   sdk.emit({ type: "agent_end", messages: [], willRetry: true })
-  const midSequence = await collector.snapshot()
-  assert.equal(
-    midSequence.filter((event) => event.kind === "turn_completed").length,
-    0
-  )
   sdk.emit({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1, errorMessage: "x" })
   sdk.emit({ type: "agent_end", messages: [], willRetry: false })
-  await session.close("done")
-  const events = await collector.end()
-  const terminals = events.filter((event) => event.kind === "turn_completed")
-  assert.equal(terminals.length, 1)
+  let events = await collector.snapshot()
+  assert.equal(countTerminals(events), 0)
+  // The run settles — exactly one terminal.
+  sdk.emit({ type: "agent_settled" })
+  events = await collector.snapshot()
+  assert.equal(countTerminals(events), 1)
   assert.equal(sdk.prompts.length, 1)
+  await session.close("done")
+  events = await collector.end()
+  assert.equal(countTerminals(events), 1)
 })
 
-test("stray agent_end with no dispatched turn is suppressed", async () => {
+test("stray agent_settled / agent_end with no dispatched turn is suppressed", async () => {
   const { session, sdk, collector } = attachSession()
   sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  sdk.emit({ type: "agent_settled" })
   await session.close("done")
   const events = await collector.end()
-  assert.equal(
-    events.filter((event) => event.kind === "turn_completed").length,
-    0
-  )
+  assert.equal(countTerminals(events), 0)
 })
 
-test("compaction continuation defers the terminal to the LAST agent_end", async () => {
+test("threshold compaction between turns does not swallow the next turn's terminal (review #11 item 3, real SDK order)", async () => {
   const { session, sdk, collector } = attachSession()
+  sdk.holdRuns()
+
+  // Turn 1. Real order: agent_end FIRST, then compaction_end. Threshold
+  // compaction does NOT continue — no second agent_end, the run settles
+  // directly.
   await session.send("long turn")
   sdk.emit({ type: "agent_start" })
-  // First low-level run ends, then the SDK's post-run hook compacts and
-  // calls agent.continue() — a second run follows within the SAME turn.
   sdk.emit({ type: "agent_end", messages: [], willRetry: false })
-  // No compaction_end yet: this is a plain terminal.
+  sdk.emit({
+    type: "compaction_end",
+    reason: "threshold",
+    result: undefined,
+    aborted: false,
+    willRetry: false,
+  })
   let events = await collector.snapshot()
-  assert.equal(
-    events.filter((event) => event.kind === "turn_completed").length,
-    1
-  )
-
-  // Now the compaction path: run 1 ends after a compaction_end (the SDK
-  // compacted mid-run and continued) — that intermediate agent_end must NOT
-  // terminal the turn while run 2 is still going.
-  await session.send("another turn")
-  sdk.emit({ type: "compaction_end", reason: "threshold", result: undefined, aborted: false, willRetry: false })
-  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  assert.equal(countTerminals(events), 0, "turn 1 must still be running")
+  sdk.emit({ type: "agent_settled" })
   events = await collector.snapshot()
-  assert.equal(
-    events.filter((event) => event.kind === "turn_completed").length,
-    1,
-    "intermediate agent_end after compaction must not terminal the turn"
-  )
-  // The continuation run finishes — only now is the second terminal allowed.
+  assert.equal(countTerminals(events), 1)
+
+  // Turn 2 after a threshold compaction: its terminal must fire normally —
+  // the old compactionContinuationPending state machine swallowed exactly
+  // this terminal (review repro).
+  await session.send("next turn after compaction")
   sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  sdk.emit({
+    type: "compaction_end",
+    reason: "threshold",
+    result: undefined,
+    aborted: false,
+    willRetry: false,
+  })
+  sdk.emit({ type: "agent_settled" })
   await session.close("done")
   events = await collector.end()
   assert.equal(
-    events.filter((event) => event.kind === "turn_completed").length,
-    2
+    countTerminals(events),
+    2,
+    "each turn keeps its own terminal across a threshold compaction"
   )
 })
 
-test("send while streaming routes through followUp", async () => {
+test("overflow-compaction continuation (agent_end → compaction_end → agent_end) yields ONE terminal", async () => {
+  const { session, sdk, collector } = attachSession()
+  sdk.holdRuns()
+  await session.send("overflowing turn")
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  sdk.emit({
+    type: "compaction_end",
+    reason: "overflow",
+    result: undefined,
+    aborted: false,
+    willRetry: true,
+  })
+  // The post-run hook continues the turn: a second low-level run.
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  let events = await collector.snapshot()
+  assert.equal(countTerminals(events), 0)
+  sdk.emit({ type: "agent_settled" })
+  await session.close("done")
+  events = await collector.end()
+  assert.equal(countTerminals(events), 1)
+})
+
+test("send() is non-blocking: a first-turn ask_question is drainable before the run settles (review #11 item 2)", async () => {
+  const { session, sdk, collector } = attachSession()
+  sdk.holdRuns()
+  const tool = session.buildAskQuestionTool() as unknown as AskTool
+
+  // The run calls ask_question mid-turn (the tool promise is pending).
+  const pendingTool = tool.execute("call-boot", {
+    questions: [{ question: "Which DB?" }],
+  })
+
+  // send() must return even though the run never settles — the old code
+  // awaited the whole prompt() and left the event stream undrained.
+  await session.send("bootstrap turn")
+
+  const snapshot = await collector.snapshot()
+  const request = snapshot.find(
+    (event) => event.kind === "user_input_requested"
+  )
+  assert.ok(request && request.kind === "user_input_requested")
+  assert.equal(countTerminals(snapshot), 0, "turn still in flight")
+
+  // The waiter is reachable and resolves the tool.
+  await session.respondPermission(request.requestId, {
+    behavior: "allow",
+    updatedInput: {
+      questions: request.questions,
+      answers: { "Which DB?": "postgres" },
+    },
+  })
+  const result = await pendingTool
+  assert.equal(result.isError, undefined)
+  assert.deepEqual(result.content, [
+    { type: "text", text: "- Which DB?: postgres" },
+  ])
+
+  // Only now does the run settle and the terminal fire.
+  sdk.emit({ type: "agent_settled" })
+  await session.close("done")
+  const events = await collector.end()
+  assert.equal(countTerminals(events), 1)
+})
+
+test("send while streaming routes through followUp; the ongoing run's settle terminals it", async () => {
   const { session, sdk, collector } = attachSession()
   sdk.isStreaming = true
   await session.send("next instruction")
-  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
-  await session.close("done")
-  const events = await collector.end()
+  let events = await collector.snapshot()
   assert.deepEqual(sdk.followUps, ["next instruction"])
   assert.deepEqual(sdk.prompts, [])
-  assert.equal(
-    events.filter((event) => event.kind === "turn_completed").length,
-    1
-  )
+  assert.equal(countTerminals(events), 0, "followUp resolution is not a terminal")
+  // The queued followUp runs inside the ongoing run; its settle is the turn.
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
+  sdk.emit({ type: "agent_settled" })
+  await session.close("done")
+  events = await collector.end()
+  assert.equal(countTerminals(events), 1)
 })
 
 test("a rejected prompt emits error + terminal for that turn", async () => {
@@ -310,17 +406,33 @@ test("a rejected prompt emits error + terminal for that turn", async () => {
   )
 })
 
-test("auto_retry_end failure emits an error event", async () => {
+test("auto_retry_end failure attributes to the CURRENT turn (error before its terminal)", async () => {
   const { session, sdk, collector } = attachSession()
+  sdk.holdRuns()
+  await session.send("flaky turn")
+  // Real order: the retry exhausts after the run's last agent_end but BEFORE
+  // agent_settled — so the error lands inside the failing turn, not the next.
+  sdk.emit({ type: "agent_end", messages: [], willRetry: false })
   sdk.emit({
     type: "auto_retry_end",
     success: false,
     attempt: 3,
     finalError: "provider down",
   })
+  sdk.emit({ type: "agent_settled" })
   await session.close("done")
   const events = await collector.end()
-  const error = events.find((event) => event.kind === "error")
+  const errorIndex = events.findIndex((event) => event.kind === "error")
+  const terminalIndex = events.findIndex(
+    (event) => event.kind === "turn_completed"
+  )
+  assert.ok(errorIndex !== -1, "error event emitted")
+  assert.ok(terminalIndex !== -1, "terminal emitted")
+  assert.ok(
+    errorIndex < terminalIndex,
+    "retry-exhausted error must precede its turn's terminal"
+  )
+  const error = events[errorIndex]
   assert.ok(error && error.kind === "error")
   assert.match(error.message, /provider down/)
 })
