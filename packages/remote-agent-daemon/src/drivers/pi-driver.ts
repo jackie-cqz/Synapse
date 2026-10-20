@@ -1,12 +1,5 @@
 import { execFileSync } from "node:child_process"
 import process from "node:process"
-import {
-  DefaultResourceLoader,
-  SessionManager,
-  createAgentSession,
-  defineTool,
-  getAgentDir,
-} from "@earendil-works/pi-coding-agent"
 import type {
   AgentSession as PiSdkAgentSession,
   AgentSessionEvent as PiSdkSessionEvent,
@@ -38,18 +31,34 @@ import {
  * conversation through the in-process TypeScript SDK
  * (`@earendil-works/pi-coding-agent`), the same pattern the Claude driver
  * uses for claude-agent-sdk. No subprocess is spawned for the agent itself;
- * the optional `pi` binary on PATH is only a catalog signal (version probe).
+ * the `pi` binary on PATH is the catalog signal (version probe + the
+ * executablePath the supervisor requires).
+ *
+ * The SDK module is imported lazily inside createSession(): it is heavy
+ * (~60MB, ~148 transitive deps incl. cloud-provider SDKs) and a static
+ * import taxed every daemon start (~0.4s) for users of other runtimes.
  *
  * Event mapping:
  *   session_started      ← sdk session id after createAgentSession resolves
  *   assistant_message    ← message_end (assistant messages with text content)
- *   turn_completed       ← agent_end (willRetry=false), one per dispatched
- *                          prompt — retry continuations (agent_end with
- *                          willRetry=true) and stray runs are not terminals
- *                          (§5d exactly-once turn completion)
+ *   turn_completed       ← agent_settled — the SDK emits exactly ONE per
+ *                          dispatched turn, after every retry continuation
+ *                          (agent_end willRetry=true), auto-compaction
+ *                          continuation (the post-run hook's agent.continue()
+ *                          runs INSIDE the same _runAgentPrompt), and queued
+ *                          followUp drain. agent_end / compaction_end are NOT
+ *                          terminals (review #11 item 3: their relative order
+ *                          differs per compaction flavor, and a threshold
+ *                          compaction emits no second agent_end at all).
  *   user_input_requested ← the ask_question custom tool suspends until
  *                          respondPermission resolves it
  *   error                ← prompt() rejection / auto_retry_end(success=false)
+ *
+ * send() is NON-BLOCKING (review #11 items 2/6): session.prompt() resolves
+ * only after the whole run settles, so awaiting it inside createSession left
+ * drainEvents unstarted until the first turn finished — an ask_question in
+ * the first turn deadlocked. send() dispatches and returns; the terminal
+ * arrives via the event stream when the run settles.
  *
  * MCP: spec.mcpServers is wired via an inline DefaultResourceLoader extension
  * calling pi.registerMcpServer (exposure "direct" so the reverse-MCP tools are
@@ -117,6 +126,22 @@ function toPiMcpServerConfig(config: McpServerConfig): PiMcpServerConfig {
 
 type PendingInputWaiter = (decision: PermissionDecision) => void
 
+/** The lazily-imported pi SDK module surface the driver consumes at runtime. */
+type PiSdkModule = {
+  DefaultResourceLoader: new (options: unknown) => unknown
+  SessionManager: {
+    findById(cwd: string, id: string): string | undefined
+    open(
+      path: string,
+      sessionDir: string | undefined,
+      cwdOverride: string
+    ): unknown
+    create(cwd: string): unknown
+  }
+  createAgentSession(options: unknown): Promise<{ session: PiSdkAgentSession }>
+  getAgentDir(): string
+}
+
 export class PiAgentSession implements AgentSession {
   readonly runtimeKind = RUNTIME_KIND.PI
 
@@ -127,24 +152,18 @@ export class PiAgentSession implements AgentSession {
   private piSessionId: string | undefined
   private closed = false
   /**
-   * Turns the runtime dispatched (seed prompt + every send()) that have not
-   * yet reached their terminal. Each dispatched turn expects exactly one
-   * agent_end(willRetry=false); stray runs (e.g. a queued followUp pi
-   * delivered on its own) must not fabricate terminals (§5d).
+   * Turns dispatched (seed prompt + every send()) whose terminal has not
+   * fired yet. The conversation runtime serializes turns (one dispatch at a
+   * time), so this is 0/1 in practice, but the counter keeps stray events
+   * from fabricating terminals (§5d exactly-once turn completion).
    */
   private dispatchedTurns = 0
   /**
-   * Auto-compaction continuation window. When the SDK's post-run hook
-   * compacts and calls agent.continue(), a single dispatched turn spans
-   * MULTIPLE low-level runs, each ending with its own agent_end
-   * (agent-loop emits one per runLoop). The intermediate agent_end must not
-   * count as the turn terminal — the SDK is still working. compaction_end
-   * (fired by _runAutoCompaction) brackets the window: an agent_end arriving
-   * after a compaction_end within a dispatched turn is treated as an
-   * intermediate boundary, and the terminal is the LAST agent_end (the one
-   * with no compaction_end behind it since the previous agent_end).
+   * The front dispatched turn expects its terminal from an `agent_settled`
+   * event. Kept as a separate flag so the prompt-path promise fallback can
+   * fire only when no settle is coming (see send()).
    */
-  private compactionContinuationPending = false
+  private settleWatchArmed = false
 
   constructor(
     readonly remoteAgentId: string,
@@ -196,39 +215,22 @@ export class PiAgentSession implements AgentSession {
         }
         return
       }
-      case "agent_end": {
-        // A retry continuation keeps the turn alive — its terminal is the
-        // FINAL attempt's agent_end (willRetry=false).
-        if (event.willRetry) return
-        if (
-          this.dispatchedTurns > 0 &&
-          this.compactionContinuationPending
-        ) {
-          // Intermediate agent_end of a compaction continuation: the SDK's
-          // post-run hook compacted and called agent.continue(), so another
-          // run (and its agent_end) is still coming. Consuming the terminal
-          // here would mark the turn complete while the SDK is still working.
-          this.compactionContinuationPending = false
-          return
-        }
-        if (this.dispatchedTurns > 0) {
+      case "agent_settled": {
+        // Turn terminal: the SDK emits exactly one agent_settled per
+        // dispatched run — AFTER retry continuations, auto-compaction
+        // continuations, and queued followUp drain have all finished.
+        if (this.settleWatchArmed && this.dispatchedTurns > 0) {
+          this.settleWatchArmed = false
           this.dispatchedTurns -= 1
           this.eventQueue.push({ kind: "turn_completed" })
         }
-        // A stray run with no dispatched turn is ignored — the runtime's
-        // terminal guard tolerates nothing here, and fabricating a terminal
-        // would advance the gate past a live turn.
-        return
-      }
-      case "compaction_end": {
-        // Auto-compaction completed. If the SDK decides to continue the turn
-        // (queued messages / overflow recovery), the NEXT agent_end belongs
-        // to the same dispatched turn — flag it so the handler above defers
-        // the terminal to the eventual final run.
-        this.compactionContinuationPending = true
+        // A stray settle with no armed turn is ignored — fabricating a
+        // terminal would advance the runtime's gate past a live turn.
         return
       }
       case "auto_retry_end": {
+        // Emitted during the run, before agent_settled, so the error
+        // attributes to the CURRENT turn (hadError=true) — not the next.
         if (!event.success) {
           const message = event.finalError ?? "unknown error"
           this.eventQueue.push({
@@ -239,6 +241,8 @@ export class PiAgentSession implements AgentSession {
         break
       }
       default:
+        // agent_end / compaction_end / agent_start / ... are observability
+        // events from the SDK's inner loop — deliberately NOT turn terminals.
         break
     }
   }
@@ -250,27 +254,52 @@ export class PiAgentSession implements AgentSession {
       throw new Error("pi session is not active")
     }
     this.dispatchedTurns += 1
-    // The conversation runtime serializes turns, so a dispatch normally lands
-    // while the session is idle. followUp covers the race where the previous
-    // run is still settling: pi queues it and runs it as the next agent run,
-    // whose agent_end becomes this turn's terminal.
-    try {
-      if (sdk.isStreaming) {
-        await sdk.followUp(prompt)
-      } else {
-        await sdk.prompt(prompt)
+    this.settleWatchArmed = true
+    // Dispatch WITHOUT awaiting the run: session.prompt() resolves only after
+    // the entire run settles, and awaiting it blocked createSession — the
+    // event stream went undrained for the whole first turn, deadlocking any
+    // ask_question in it (review #11 item 2) and serializing unrelated
+    // conversations behind one long turn (item 6).
+    const viaFollowUp = sdk.isStreaming
+    const dispatch = viaFollowUp
+      ? Promise.resolve(sdk.followUp(prompt))
+      : Promise.resolve(sdk.prompt(prompt))
+    void dispatch.then(
+      () => {
+        // Fallback terminal for prompt-path dispatches that ended WITHOUT an
+        // agent run (extension command handled the prompt; preflight deferral
+        // edge). In the normal flow agent_settled already fired mid-run and
+        // consumed the watch before this runs. The isStreaming guard covers a
+        // prompt() that returned early while a deferred run is still active.
+        // followUp promises resolve as soon as the message is QUEUED, so they
+        // never take this fallback — the ongoing run's agent_settled owns it.
+        if (
+          !viaFollowUp &&
+          this.settleWatchArmed &&
+          this.dispatchedTurns > 0 &&
+          !sdk.isStreaming
+        ) {
+          this.settleWatchArmed = false
+          this.dispatchedTurns -= 1
+          this.eventQueue.push({ kind: "turn_completed" })
+        }
+      },
+      (error: unknown) => {
+        // Dispatch rejected (pre-run throw: extension command refused,
+        // pre-compaction failure, ...). No run started, so no agent_settled
+        // is coming — this turn must terminal HERE or it wedges the gate.
+        const message = error instanceof Error ? error.message : String(error)
+        this.eventQueue.push({
+          kind: "error",
+          message: `pi prompt failed: ${message}`,
+        })
+        if (this.settleWatchArmed && this.dispatchedTurns > 0) {
+          this.settleWatchArmed = false
+          this.dispatchedTurns -= 1
+          this.eventQueue.push({ kind: "turn_completed" })
+        }
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      this.eventQueue.push({
-        kind: "error",
-        message: `pi prompt failed: ${message}`,
-      })
-      if (this.dispatchedTurns > 0) {
-        this.dispatchedTurns -= 1
-        this.eventQueue.push({ kind: "turn_completed" })
-      }
-    }
+    )
   }
 
   async respondPermission(
@@ -312,10 +341,12 @@ export class PiAgentSession implements AgentSession {
   /**
    * The ask_question tool: suspends the agent run until the Synapse-side task
    * card resolves, then returns the user's answers as the tool result.
+   * Built as a plain definition object (defineTool is an identity function);
+   * no SDK runtime import needed, so this is callable from unit tests.
    * (Exported for unit tests; production callers reach it via createSession.)
    */
   buildAskQuestionTool(): PiToolDefinition {
-    return defineTool({
+    return {
       name: "ask_question",
       label: "Ask the user",
       description:
@@ -365,7 +396,7 @@ export class PiAgentSession implements AgentSession {
         })
         return buildAskQuestionToolResult(decision)
       },
-    })
+    } as PiToolDefinition
   }
 }
 
@@ -379,18 +410,26 @@ export class PiDriver implements AgentDriver {
 
   detect(): RuntimeCatalogEntry {
     const probe = detectPiBinary()
-    // The agent runs in-process via the bundled SDK; the `pi` binary is only
-    // a convenience signal that the operator has pi set up on this machine.
-    // Without it we still report available (auth lives in ~/.pi/agent), but
-    // carry whatever probe metadata we have.
+    if (!probe.path) {
+      // The agent runs in-process via the SDK (a hard daemon dependency, so
+      // its presence is guaranteed), but the supervisor refuses to start a
+      // runtime whose catalog entry lacks an executablePath (it gates on
+      // status "available" + a resolved path). Reporting available without a
+      // path would let a conversation arm a turn that fails at wake with a
+      // confusing error — so the honest catalog signal without the CLI is
+      // missing_binary, with guidance pointing at the fix (install pi).
+      return {
+        runtimeKind: this.runtimeKind,
+        status: "missing_binary",
+        lastError:
+          "pi CLI not found on PATH (set SYNAPSE_PI_PATH or install pi; the daemon runs pi in-process via its SDK but requires the CLI for the runtime catalog to advertise it)",
+      }
+    }
     return {
       runtimeKind: this.runtimeKind,
       executablePath: probe.path,
       status: "available",
       version: probe.version,
-      metadata: probe.path
-        ? undefined
-        : { note: "in-process SDK; pi binary not on PATH" },
     }
   }
 
@@ -401,7 +440,13 @@ export class PiDriver implements AgentDriver {
       spec.resumeSessionId
     )
 
-    const sessionManager = this.resolveSessionManager(spec)
+    // Lazy-load the SDK: heavy module (~60MB / ~148 transitive deps), and
+    // only pi-kind conversations need it. detect() never touches it.
+    const sdkModule = (await import(
+      "@earendil-works/pi-coding-agent"
+    )) as unknown as PiSdkModule
+
+    const sessionManager = this.resolveSessionManager(spec, sdkModule)
     if (this.lastResumeFallbackReason) {
       session.emitError(this.lastResumeFallbackReason)
       this.lastResumeFallbackReason = undefined
@@ -411,13 +456,15 @@ export class PiDriver implements AgentDriver {
     // pi.registerMcpServer with exposure "direct" declares the tools to the
     // model. No servers → no extension, keep the loader default.
     const mcpEntries = Object.entries(spec.mcpServers ?? {})
-    const resourceLoader = new DefaultResourceLoader({
+    const resourceLoader = new sdkModule.DefaultResourceLoader({
       cwd: spec.workingDirectory,
-      agentDir: getAgentDir(),
+      agentDir: sdkModule.getAgentDir(),
       ...(mcpEntries.length > 0
         ? {
             extensionFactories: [
-              (pi) => {
+              (pi: {
+                registerMcpServer: (name: string, config: unknown) => void
+              }) => {
                 for (const [name, config] of mcpEntries) {
                   pi.registerMcpServer(name, toPiMcpServerConfig(config))
                 }
@@ -432,7 +479,7 @@ export class PiDriver implements AgentDriver {
     // config, so mutating the daemon-wide env matches its semantics.
     applyEnvOverlay(spec.childEnvOverlay)
 
-    const { session: sdk } = await createAgentSession({
+    const { session: sdk } = await sdkModule.createAgentSession({
       cwd: spec.workingDirectory,
       sessionManager,
       customTools: [session.buildAskQuestionTool()],
@@ -440,13 +487,21 @@ export class PiDriver implements AgentDriver {
     })
     session.attach(sdk)
 
+    // Fire the bootstrap turn WITHOUT awaiting its completion (review #11
+    // item 2): send() returns after dispatching, so the runtime gets the
+    // session back immediately and drainEvents starts consuming events —
+    // including any user_input_requested from this very first turn.
     if (spec.initialPrompt.trim()) {
       await session.send(spec.initialPrompt)
     }
     return session
   }
 
-  private resolveSessionManager(spec: SessionSpec): SessionManager {
+  private resolveSessionManager(
+    spec: SessionSpec,
+    sdkModule: PiSdkModule
+  ): unknown {
+    const { SessionManager } = sdkModule
     if (spec.resumeSessionId) {
       const path = SessionManager.findById(
         spec.workingDirectory,
