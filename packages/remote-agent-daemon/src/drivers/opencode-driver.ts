@@ -1,4 +1,4 @@
-import { execSync, spawn, type ChildProcess } from "node:child_process"
+import { execFileSync, spawn, type ChildProcess } from "node:child_process"
 import process from "node:process"
 import { createInterface } from "node:readline"
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk"
@@ -26,7 +26,8 @@ import {
  *
  * Transport: one subprocess per send (per-turn process, NOT a long-lived
  * app-server like codex). NDJSON events on stdout are parsed into
- * AgentSessionEvent; the process exiting (session idle) is the turn's
+ * AgentSessionEvent; the child's 'close' event (all stdio drained — NOT
+ * 'exit', which can fire before buffered stderr is readable) is the turn's
  * terminal. Session persistence rides on opencode's own session storage:
  * the first run's `sessionID` (present in every event envelope, including
  * errors) is captured and passed as `-s <id>` on later runs, which opencode
@@ -59,7 +60,11 @@ function detectOpencodeBinary(): { path?: string; version?: string } {
   if (!path) return {}
   let version: string | undefined
   try {
-    const probe = execSync(`"${path}" --version`, {
+    // execFileSync (no shell): SYNAPSE_OPENCODE_PATH is machine-operator
+    // input, and the old `execSync(`"${path}" --version`)` interpolation ran
+    // it through a shell — a path with metacharacters was a command-injection
+    // surface (review #11).
+    const probe = execFileSync(path, ["--version"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     })
@@ -241,6 +246,15 @@ class OpencodeAgentSession implements AgentSession {
 
   private awaitTurnChild(prompt: string, outcome: TurnOutcome = { sawErrorEvent: false }): Promise<void> {
     return new Promise<void>((resolve) => {
+      // Exactly-once terminal guard: a failed spawn emits 'error' AND THEN
+      // 'close' (Node docs), so the close handler must not re-finalize.
+      let settled = false
+      const settle = () => {
+        if (!settled) {
+          settled = true
+          resolve()
+        }
+      }
       const child = spawn(this.runtimePath, this.buildArgs(prompt), {
         cwd: this.workingDirectory,
         stdio: ["ignore", "pipe", "pipe"],
@@ -271,7 +285,8 @@ class OpencodeAgentSession implements AgentSession {
         })
       }
       child.once("error", (error) => {
-        // spawn failure (ENOENT etc.) — terminal for this turn.
+        // spawn failure (ENOENT etc.) — terminal for this turn. 'close' still
+        // fires after 'error'; the settled guard absorbs it.
         this.eventQueue.push({
           kind: "error",
           message: `failed to start opencode: ${
@@ -279,10 +294,19 @@ class OpencodeAgentSession implements AgentSession {
           }`,
         })
         this.eventQueue.push({ kind: "turn_completed" })
-        resolve()
-      })
-      child.once("exit", (code, signal) => {
         this.child = null
+        settle()
+      })
+      // Finalize on 'close', NOT 'exit' (review #11 [5]): 'close' fires only
+      // after every stdio stream has drained, so the stderr tail above is
+      // complete when finalizeTurn reads it. Under an 'exit' listener a child
+      // that exits before its pipes flush (large stderr bursts on Linux)
+      // finalizes with a truncated/empty tail — losing "Session not found"
+      // and silently disabling the stale-session self-heal below.
+      child.once("close", (code, signal) => {
+        this.child = null
+        if (settled) return
+        settled = true
         this.finalizeTurn(outcome, code, signal)
         resolve()
       })
@@ -290,8 +314,19 @@ class OpencodeAgentSession implements AgentSession {
   }
 
   async send(prompt: string, _options?: SendPromptOptions) {
-    this.sendChain = this.sendChain.then(() => this.runTurn(prompt))
-    await this.sendChain
+    // Non-blocking dispatch (review #11 [6]): hand the prompt to the serialized
+    // turn chain and return immediately. The turn's terminal arrives via
+    // events() (turn_completed), which is what the conversation runtime's gate
+    // listens to — awaiting the full child run here would (a) block the
+    // daemon's sequential per-frame delivery loop, letting one long turn delay
+    // every other conversation, and (b) let the post-send "running" status the
+    // caller publishes overwrite the "idle" status onTurnCompleted already
+    // published for this turn. runTurn never rejects (internal failures become
+    // error + turn_completed events); the catch only guards against an
+    // eventQueue failure turning into an unhandled rejection.
+    this.sendChain = this.sendChain
+      .then(() => this.runTurn(prompt))
+      .catch(() => undefined)
   }
 
   async respondPermission(

@@ -371,3 +371,134 @@ test("clean exit-0 turn emits NO error event (spurious-error regression)", async
     await session.close("test done")
   }
 })
+
+test("send() returns without waiting for the turn to finish (non-blocking dispatch)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-nonblock-"))
+  const slow = path.join(dir, "slow-opencode")
+  // Sleeps 2s before emitting the turn — long enough that a blocking send()
+  // (the old `await this.sendChain`) would visibly exceed the margin, short
+  // enough to keep the suite fast.
+  writeFileSync(
+    slow,
+    `#!/bin/sh
+sleep 2
+echo '{"type":"step_start","timestamp":1,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"step-start"}}'
+echo '{"type":"text","timestamp":2,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"text","text":"slow reply","time":{"start":1,"end":2}}}'
+echo '{"type":"step_finish","timestamp":3,"sessionID":"${FAKE_SESSION_ID}","part":{"type":"step-finish","reason":"stop"}}'
+exit 0
+`,
+    { mode: 0o755 }
+  )
+  const driver = new OpencodeDriver()
+  const session = await driver.createSession({
+    remoteAgentId: "agent-1",
+    conversationId: "conv-11",
+    workingDirectory: dir,
+    initialPrompt: "hi",
+    resumeSessionId: FAKE_SESSION_ID,
+    runtimePath: slow,
+  })
+  try {
+    // Bootstrap turn is itself non-blocking now; wait for it to finish so the
+    // send below is the one measured.
+    await collectSessionEvents(session)
+    const started = Date.now()
+    await session.send("slow prompt")
+    const elapsed = Date.now() - started
+    assert.ok(
+      elapsed < 1500,
+      `send() must hand off to the turn chain and return (took ${elapsed}ms)`
+    )
+    // The turn still completes via events().
+    const events = await collectSessionEvents(session)
+    const kinds = events.map((event) => event.kind)
+    assert.ok(kinds.includes("assistant_message"))
+    assert.equal(kinds[kinds.length - 1], "turn_completed")
+  } finally {
+    await session.close("test done")
+  }
+})
+
+test("stderr larger than the pipe buffer is fully drained before finalization (close-event regression)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-stddeburburst-"))
+  const failing = path.join(dir, "stderr-burst-opencode")
+  // ~120KB of stderr (> the 64KB pipe buffer) with the diagnostic we care
+  // about LAST. Under the old 'exit' listener the terminal could fire while
+  // the pipe still held buffered chunks (reviewer reproduced this failing on
+  // Linux/Node 24): the tail was truncated and "Session not found" — and the
+  // stale-session self-heal keyed on it — silently vanished. 'close' fires
+  // only after every stdio stream drained, so the full tail is visible.
+  writeFileSync(
+    failing,
+    `#!/bin/sh
+i=0
+while [ $i -lt 4000 ]; do
+  echo "filler noise line $i padding padding padding" >&2
+  i=$((i+1))
+done
+echo 'Error: Session not found' >&2
+exit 1
+`,
+    { mode: 0o755 }
+  )
+  const driver = new OpencodeDriver()
+  const session = await driver.createSession({
+    remoteAgentId: "agent-1",
+    conversationId: "conv-9",
+    workingDirectory: dir,
+    initialPrompt: "hi",
+    resumeSessionId: "ses_stale_for_burst",
+    runtimePath: failing,
+  })
+  try {
+    const events = await collectSessionEvents(session)
+    const error = events.find((event) => event.kind === "error")
+    assert.ok(error, "expected an error event")
+    if (error && error.kind === "error") {
+      assert.match(
+        error.message,
+        /Session not found/,
+        "the stderr tail (incl. the trailing diagnostic past the pipe buffer) must be drained"
+      )
+      assert.match(error.message, /exited with code 1/)
+    }
+    // The stale-session self-heal keyed on the drained stderr must fire.
+    assert.equal(session.sessionId, undefined)
+  } finally {
+    await session.close("test done")
+  }
+})
+
+test("spawn error followed by close emits exactly one terminal (no double-finalize)", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "opencode-errclose-"))
+  const driver = new OpencodeDriver()
+  const session = await driver.createSession({
+    remoteAgentId: "agent-1",
+    conversationId: "conv-10",
+    workingDirectory: dir,
+    initialPrompt: "hi",
+    runtimePath: path.join(dir, "definitely-not-installed-opencode"),
+  })
+  const events: AgentSessionEvent[] = []
+  const drained = (async () => {
+    for await (const event of session.events()) events.push(event)
+  })()
+  try {
+    // A failed spawn emits 'error' AND THEN 'close' (Node docs). Give both
+    // time to fire before closing the stream.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  } finally {
+    await session.close("test done")
+  }
+  await drained
+  assert.equal(
+    events.filter((event) => event.kind === "error").length,
+    1,
+    `exactly one error, saw ${events.map((e) => e.kind).join(",")}`
+  )
+  assert.equal(
+    events.filter((event) => event.kind === "turn_completed").length,
+    1,
+    "close after spawn-error must not finalize a second terminal"
+  )
+})
